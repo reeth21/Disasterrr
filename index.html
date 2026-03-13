@@ -1,0 +1,923 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Disaster Alert System - Enhanced Control Room</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="newstyles.css">
+    <!-- Firebase Realtime Database SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.9.0/firebase-database-compat.js"></script>
+</head>
+
+<body>
+    <div class="container" id="app"></div>
+
+    <script>
+        // Audio Context for Buzzer
+        let audioContext = null;
+        let buzzerInterval = null;
+        let autoDialTimeout = null;
+
+        function playBuzzer() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+
+            const beep = () => {
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+
+                oscillator.frequency.value = 800;
+                oscillator.type = 'square';
+
+                gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + 0.1);
+            };
+
+            beep();
+            setTimeout(beep, 200);
+        }
+
+        function startContinuousBuzzer() {
+            if (buzzerInterval) return;
+            playBuzzer();
+            buzzerInterval = setInterval(playBuzzer, 1000);
+        }
+
+        function stopBuzzer() {
+            if (buzzerInterval) {
+                clearInterval(buzzerInterval);
+                buzzerInterval = null;
+            }
+            if (autoDialTimeout) {
+                clearTimeout(autoDialTimeout);
+                autoDialTimeout = null;
+            }
+        }
+
+        function autoDialEmergency(number, service, flat) {
+            autoDialTimeout = setTimeout(() => {
+                const message = `AUTO-DIALING EMERGENCY\n\nConnecting to: ${service}\nNumber: ${number}\nLocation: Flat ${flat}`;
+
+                // Try to open phone dialer
+                window.location.href = `tel:${number}`;
+
+                // Show notification
+                console.log(message);
+            }, 1000);
+        }
+
+        // Initialize Firebase
+        const firebaseConfig = {
+            apiKey: "AIzaSyCUuj7P52-n2vOOeOhsDiHwW5R-uf8r25Y",
+            authDomain: "disaster-5fe05.firebaseapp.com",
+            projectId: "disaster-5fe05",
+            storageBucket: "disaster-5fe05.firebasestorage.app",
+            messagingSenderId: "212670668505",
+            appId: "1:212670668505:web:27cba429eb12fa6a4e68c8",
+            measurementId: "G-WQ7B5TQPQD",
+            databaseURL: "https://disaster-5fe05-default-rtdb.firebaseio.com/"
+        };
+        firebase.initializeApp(firebaseConfig);
+        const database = firebase.database();
+
+        // Application State
+        const state = {
+            isLoggedIn: false,
+            loginType: null,
+            currentFlat: null,
+            currentView: 'overview',
+            currentTab: 'overview',
+            showBuzzer: false,
+            alertTriggered: false,
+            alertHistory: [],
+            sensors: {
+                gas: { name: '💨 Gas Sensor', unit: 'ppm', limit: 100, icon: '💨' },
+                smoke: { name: '🔥 Smoke Detector', unit: 'ppm', limit: 60, icon: '🔥' },
+                fire: { name: '🔴 Fire Detector', unit: '°C', limit: 80, icon: '🔴' },
+                temperature: { name: '🌡️ Temperature', unit: '°C', limit: 60, icon: '🌡️' },
+                water: { name: '💧 Water Leak', unit: 'Level', limit: 5, icon: '💧' },
+                motion: { name: '👤 Motion Detector', unit: 'Activity', limit: 100, icon: '👤' }
+            },
+            thresholds: {
+                gas: 100,
+                smoke: 60,
+                fire: 80,
+                temperature: 60,
+                water: 5,
+                motion: 100
+            },
+            flats: [],
+            currentAlert: null,
+            selectedFlat: null,
+            loginForm: {
+                type: 'flat',
+                flat: '',
+                password: '',
+                error: ''
+            }
+        };
+
+        // Emergency contacts mapping
+        const emergencyContacts = {
+            fire: { service: 'Fire Department', number: '101', icon: '🚒' },
+            smoke: { service: 'Fire Department', number: '101', icon: '🚒' },
+            gas: { service: 'Gas Emergency', number: '1906', icon: '⚠️' },
+            motion: { service: 'Security/Police', number: '100', icon: '👮' },
+            water: { service: 'Plumbing Emergency', number: '1800-XXX-XXXX', icon: '🔧' },
+            temperature: { service: 'Building Maintenance', number: '1800-XXX-XXXX', icon: '🛠️' }
+        };
+
+        // Initialize flats
+        function initializeFlats() {
+            // Initialize local structure
+            state.flats = [];
+            for (let floor = 1; floor <= 8; floor++) {
+                for (let flat = 1; flat <= 4; flat++) {
+                    const flatNumber = floor * 100 + flat;
+                    state.flats.push({
+                        flatNumber: flatNumber,
+                        floor: floor,
+                        sensors: { gas: 20, smoke: 10, fire: 25, temperature: 20, water: 0, motion: 20 },
+                        hasAlert: false,
+                        alertSensor: null
+                    });
+                }
+            }
+
+            // Sync to Firebase
+            const flatsRef = database.ref('flats');
+            console.log("Connecting to Firebase Database at:", flatsRef.toString());
+
+            flatsRef.on('value', (snapshot) => {
+                const data = snapshot.val();
+                console.log("Firebase Data Received:", data);
+                if (data) {
+                    state.flats.forEach(f => {
+                        if (data[f.flatNumber]) {
+                            f.sensors = data[f.flatNumber].sensors || f.sensors;
+                            let alertFound = false;
+                            Object.keys(f.sensors).forEach(sensorType => {
+                                if (f.sensors[sensorType] > state.thresholds[sensorType]) {
+                                    if (!f.hasAlert) triggerAlert(f.flatNumber, sensorType, false);
+                                    alertFound = true;
+                                }
+                            });
+                            if (!alertFound && f.hasAlert) {
+                                f.hasAlert = false;
+                                f.alertSensor = null;
+                            }
+                        }
+                    });
+                    if (state.isLoggedIn) render();
+                } else {
+                    console.log("Database empty, seeding data...");
+                    const initialData = {};
+                    state.flats.forEach(f => {
+                        initialData[f.flatNumber] = { sensors: f.sensors };
+                    });
+                    flatsRef.set(initialData).catch(err => {
+                        console.error("Firebase Seed Error (Check Rules!):", err);
+                    });
+                }
+            }, (error) => {
+                console.error("Firebase Permission Error (Check Rules!):", error);
+            });
+        }
+
+        function initializeSensors() {
+            return {
+                gas: getRandomValue(20, 80),
+                smoke: getRandomValue(10, 50),
+                fire: getRandomValue(25, 65),
+                temperature: getRandomValue(20, 50),
+                water: getRandomValue(0, 3),
+                motion: getRandomValue(20, 80)
+            };
+        }
+
+        function getRandomValue(min, max) {
+            return Math.random() * (max - min) + min;
+        }
+
+        // Update sensor values naturally
+        function updateSensorValues() {
+            state.flats.forEach(flat => {
+                Object.keys(flat.sensors).forEach(sensorType => {
+                    const currentValue = flat.sensors[sensorType];
+                    const threshold = state.thresholds[sensorType];
+
+                    // If this flat has an alert for this sensor, keep it high
+                    if (flat.hasAlert && flat.alertSensor === sensorType) {
+                        flat.sensors[sensorType] = threshold * 1.2 + Math.random() * 10;
+                    } else {
+                        // Natural fluctuation within safe range
+                        const change = (Math.random() - 0.5) * 2;
+                        let newValue = currentValue + change;
+
+                        // Keep within safe range (0 to 80% of threshold)
+                        const maxSafe = threshold * 0.8;
+                        newValue = Math.max(0, Math.min(newValue, maxSafe));
+
+                        flat.sensors[sensorType] = newValue;
+                    }
+                });
+            });
+        }
+
+        // Trigger alert for specific flat and sensor
+        function triggerAlert(flatNumber, sensorType, updateDb = true) {
+            const flat = state.flats.find(f => f.flatNumber === flatNumber);
+            if (!flat) return;
+
+            // Clear any existing alerts
+            clearAllAlerts();
+
+            // Set new alert
+            flat.hasAlert = true;
+            flat.alertSensor = sensorType;
+            flat.sensors[sensorType] = state.thresholds[sensorType] * 1.3;
+            if (updateDb) {
+                database.ref("flats/" + flatNumber + "/sensors/" + sensorType).set(state.thresholds[sensorType] * 1.3);
+            }
+            if (updateDb) {
+                database.ref("flats/" + flatNumber + "/sensors/" + sensorType).set(state.thresholds[sensorType] * 1.3);
+            }
+
+            const emergency = emergencyContacts[sensorType];
+
+            state.currentAlert = {
+                flat: flatNumber,
+                floor: flat.floor,
+                sensor: sensorType,
+                sensorName: state.sensors[sensorType].name,
+                value: flat.sensors[sensorType].toFixed(1),
+                unit: state.sensors[sensorType].unit,
+                emergency: emergency,
+                timestamp: new Date()
+            };
+
+            // Add to history
+            state.alertHistory.unshift({
+                ...state.currentAlert,
+                status: 'active',
+                id: Date.now()
+            });
+
+            state.showBuzzer = true;
+            startContinuousBuzzer();
+            autoDialEmergency(emergency.number, emergency.service, flatNumber);
+
+            render();
+        }
+
+        // Auto-trigger alert on login
+        function autoTriggerAlert() {
+            // Auto-triggering alerts logic has been disabled
+        }
+
+        // Clear all alerts
+        function clearAllAlerts() {
+            state.flats.forEach(flat => {
+                flat.hasAlert = false;
+                flat.alertSensor = null;
+            });
+        }
+
+        // Acknowledge alert
+        function acknowledgeAlert() {
+            if (state.currentAlert) {
+                const historyItem = state.alertHistory.find(h => h.id === state.currentAlert.timestamp.getTime());
+                if (historyItem) {
+                    historyItem.status = 'cleared';
+                    historyItem.clearedAt = new Date();
+                }
+            }
+
+            clearAllAlerts();
+            state.showBuzzer = false;
+            state.currentAlert = null;
+            stopBuzzer();
+            render();
+        }
+
+        // Login
+        function handleLogin() {
+            const { type, flat, password } = state.loginForm;
+
+            if (type === 'flat') {
+                if (!flat) {
+                    state.loginForm.error = 'Please select a flat';
+                    render();
+                    return;
+                }
+                if (password !== 'flat123') {
+                    state.loginForm.error = 'Incorrect password';
+                    render();
+                    return;
+                }
+                state.currentFlat = parseInt(flat);
+                state.loginType = 'flat';
+            } else if (type === 'simulator') {
+                if (password !== 'simulate123') {
+                    state.loginForm.error = 'Incorrect password';
+                    render();
+                    return;
+                }
+                state.loginType = 'simulator';
+            } else {
+                if (password !== 'ControlRoom@2025') {
+                    state.loginForm.error = 'Incorrect password';
+                    render();
+                    return;
+                }
+                state.loginType = 'control';
+            }
+
+            state.isLoggedIn = true;
+            state.loginForm.error = '';
+            autoTriggerAlert();
+            // setInterval(updateSensorValues, 2000); // Disabled natural fluctuations so alerts only fire on manual tests.
+            render();
+        }
+
+        // Logout
+        function handleLogout() {
+            state.isLoggedIn = false;
+            state.loginType = null;
+            state.currentFlat = null;
+            state.alertTriggered = false;
+            state.currentView = 'overview';
+            state.currentTab = 'overview';
+            state.selectedFlat = null;
+            clearAllAlerts();
+            stopBuzzer();
+            state.showBuzzer = false;
+            initializeFlats();
+            render();
+        }
+
+        // Update thresholds
+        function updateThreshold(sensor, value) {
+            state.thresholds[sensor] = parseFloat(value);
+            render();
+        }
+
+        // Save thresholds
+        function saveThresholds() {
+            alert('Safety thresholds updated successfully!');
+        }
+
+        // Render Functions
+        function renderLogin() {
+            const { type, flat, password, error } = state.loginForm;
+
+            let roleName = {
+                'flat': '🏠 Flat Owner',
+                'control': '🎛️ Admin',
+                'simulator': '⚠️ Simulator'
+            }[type];
+
+            if (type === 'flat' && flat) {
+                roleName += ` - Flat ${flat}`;
+            }
+
+            return `
+                <div class="login-container">
+                    <h2 style="display: flex; align-items: center; justify-content: center; gap: 10px;">
+                        <span style="font-size: 34px;">🏢</span> Disaster Alert System
+                    </h2>
+                    <p style="text-align: center; color: #718096; margin-bottom: 35px; font-size: 16px;">Smart Apartment Safety Management</p>
+                    
+                    ${error ? `<div class="error-message">${error}</div>` : ''}
+                    
+                    <div class="login-buttons">
+                        <button class="login-btn ${type === 'flat' ? 'active' : ''}" onclick="state.loginForm.type = 'flat'; state.loginForm.error = ''; render();">
+                            🏠 Flat
+                        </button>
+                        <button class="login-btn ${type === 'control' ? 'active' : ''}" onclick="state.loginForm.type = 'control'; state.loginForm.error = ''; render();">
+                            🎛️ Admin
+                        </button>
+                        <button class="login-btn ${type === 'simulator' ? 'active' : ''}" onclick="state.loginForm.type = 'simulator'; state.loginForm.error = ''; render();">
+                            ⚠️ Simulator
+                        </button>
+                    </div>
+
+                    <div style="background: transparent; padding: 18px 20px; border-radius: 12px; margin-bottom: 25px; text-align: center; border: 1px solid #cbd5e0; font-size: 16px; color: #4a5568;">
+                        Selected Role: <strong style="color: #1e293b; margin-left: 5px;">${roleName}</strong>
+                    </div>
+                    
+                    ${type === 'flat' ? `
+                        <div class="form-group">
+                            <label>Select Your Flat:</label>
+                            <select value="${flat}" onchange="state.loginForm.flat = this.value; render();">
+                                <option value="">Choose your flat...</option>
+                                ${state.flats.map(f => `
+                                    <option value="${f.flatNumber}">Floor ${f.floor} - Flat ${f.flatNumber}</option>
+                                `).join('')}
+                            </select>
+                        </div>
+                    ` : ''}
+                    
+                    <div class="form-group">
+                        <label>Password for ${roleName}:</label>
+                        <input type="password" placeholder="Enter password" value="${password}"
+                            oninput="state.loginForm.password = this.value"
+                            onkeypress="if(event.key === 'Enter') handleLogin()">
+                    </div>
+                    
+                    <button class="submit-btn" onclick="handleLogin()">Login as ${roleName}</button>
+                </div>
+            `;
+        }
+
+        function renderFlatOwnerView() {
+            const flat = state.flats.find(f => f.flatNumber === state.currentFlat);
+            if (!flat) return '';
+
+            const hasActiveAlert = flat.hasAlert;
+
+            return `
+                <div class="header">
+                    <div>
+                        <h1>Flat ${flat.flatNumber}</h1>
+                        <p style="color: #666;">Floor ${flat.floor}</p>
+                    </div>
+                    <div class="header-info">
+                        <div class="status-badge ${hasActiveAlert ? 'status-alert' : 'status-safe'}">
+                            ${hasActiveAlert ? '🚨 ALERT' : '✓ Safe'}
+                        </div>
+                        <button class="btn btn-danger" onclick="handleLogout()">Logout</button>
+                    </div>
+                </div>
+
+                <div class="tab-content">
+                    <h2 style="margin-bottom: 20px;">Sensor Dashboard</h2>
+                    <div class="sensor-list">
+                        ${Object.keys(state.sensors).map(sensorType => {
+                const sensor = state.sensors[sensorType];
+                const value = flat.sensors[sensorType];
+                const threshold = state.thresholds[sensorType];
+                const isDanger = value > threshold;
+                const percentage = Math.min((value / threshold) * 100, 100);
+
+                return `
+                                <div class="sensor-item ${isDanger ? 'danger' : ''}">
+                                    <div class="sensor-header">
+                                        <span class="sensor-name">
+                                            ${sensor.icon} ${sensor.name}
+                                        </span>
+                                        <span class="sensor-value ${isDanger ? 'danger' : ''}">
+                                            ${value.toFixed(1)} ${sensor.unit}
+                                        </span>
+                                    </div>
+                                    <div class="sensor-bar">
+                                        <div class="sensor-progress ${isDanger ? 'danger' : ''}" 
+                                             style="width: ${percentage}%"></div>
+                                    </div>
+                                    <div class="sensor-limit">
+                                        Safe Limit: ≤ ${threshold} ${sensor.unit}
+                                    </div>
+                                </div>
+                            `;
+            }).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+
+        function renderSimulatorView() {
+            return `
+                <div class="header">
+                    <div>
+                        <h1>⚠️ Hardware Simulator</h1>
+                        <p style="color: #666;">Temporary Disaster Account</p>
+                    </div>
+                    <div class="header-info">
+                        <button class="btn btn-danger" onclick="handleLogout()">Logout</button>
+                    </div>
+                </div>
+
+                <div class="admin-section">
+                    <h3>🎛️ Manual Sensor Overrides</h3>
+                    <p style="color: #666; margin-bottom: 20px;">Select a flat and manually adjust its sensor readings. These changes will push to the database and alert ALL connected devices instantly.</p>
+                    
+                    <div style="margin-bottom: 25px;">
+                        <label style="font-weight: 600; display: block; margin-bottom: 8px;">Target Flat:</label>
+                        <select id="simFlat" style="width: 100%; max-width: 400px; padding: 12px; border: 2px solid #ddd; border-radius: 8px;" onchange="state.selectedFlat = parseInt(this.value); render();">
+                            <option value="">Select a flat...</option>
+                            ${state.flats.map(f => `
+                                <option value="${f.flatNumber}" ${state.selectedFlat === f.flatNumber ? 'selected' : ''}>Flat ${f.flatNumber} (Floor ${f.floor})</option>
+                            `).join('')}
+                        </select>
+                    </div>
+
+                    ${state.selectedFlat ? `
+                        <div class="sensor-list">
+                            ${Object.keys(state.sensors).map(sensorType => {
+                const sensor = state.sensors[sensorType];
+                const flat = state.flats.find(f => f.flatNumber === state.selectedFlat);
+                const currentValue = flat.sensors[sensorType];
+                const threshold = state.thresholds[sensorType];
+
+                return `
+                                    <div class="sensor-item" style="padding: 15px;">
+                                        <div class="sensor-header">
+                                            <span class="sensor-name">${sensor.icon} ${sensor.name}</span>
+                                            <span class="sensor-value" style="font-size: 18px;">${currentValue.toFixed(1)} ${sensor.unit}</span>
+                                        </div>
+                                        <input type="range" 
+                                               min="0" 
+                                               max="${threshold * 2}" 
+                                               value="${currentValue}" 
+                                               style="width: 100%; margin: 10px 0;"
+                                               onchange="
+                                                   const val = parseFloat(this.value);
+                                                   database.ref('flats/' + state.selectedFlat + '/sensors/${sensorType}').set(val);
+                                                   const flatObj = state.flats.find(f => f.flatNumber === state.selectedFlat);
+                                                   flatObj.sensors['${sensorType}'] = val;
+                                                   if (val > ${threshold}) {
+                                                       triggerAlert(state.selectedFlat, '${sensorType}');
+                                                   }
+                                                   render();
+                                               ">
+                                        <div class="sensor-limit">Alert Threshold: ${threshold} ${sensor.unit}</div>
+                                    </div>
+                                `;
+            }).join('')}
+                        </div>
+                    ` : '<div style="padding: 30px; text-align: center; color: #666; background: #f8f9fa; border-radius: 10px;">Please select a flat to simulate data for.</div>'}
+                </div>
+            `;
+        }
+
+        function renderControlRoomOverview() {
+            const alertCount = state.flats.filter(f => f.hasAlert).length;
+
+            return `
+                <h2 style="margin-bottom: 20px;">All Flats Overview</h2>
+                <div style="margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 8px;">
+                    <strong>Total Flats:</strong> 32 | 
+                    <strong>Active Alerts:</strong> <span style="color: ${alertCount > 0 ? '#dc3545' : '#28a745'}">${alertCount}</span>
+                </div>
+                <div class="dashboard-grid">
+                    ${state.flats.map(flat => `
+                        <div class="flat-card ${flat.hasAlert ? 'alert' : ''}" 
+                             onclick="state.selectedFlat = ${flat.flatNumber}; render();">
+                            <div class="flat-number">Flat ${flat.flatNumber}</div>
+                            <div class="flat-floor">Floor ${flat.floor}</div>
+                            <div class="flat-status">
+                                <span class="status-icon">${flat.hasAlert ? '🚨' : '✓'}</span>
+                                <span>${flat.hasAlert ? 'ALERT - ' + state.sensors[flat.alertSensor].name : 'All Systems Safe'}</span>
+                            </div>
+                            <div style="margin-top: 10px; font-size: 12px; color: #666;">
+                                Click to view sensors →
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        function renderFlatDetails() {
+            const flat = state.flats.find(f => f.flatNumber === state.selectedFlat);
+            if (!flat) return '';
+
+            return `
+                <button class="btn btn-outline" onclick="state.selectedFlat = null; render();">
+                    ← Back to Overview
+                </button>
+                
+                <h2 style="margin-bottom: 20px;">Flat ${flat.flatNumber} - Floor ${flat.floor}</h2>
+                
+                <div class="sensor-list">
+                    ${Object.keys(state.sensors).map(sensorType => {
+                const sensor = state.sensors[sensorType];
+                const value = flat.sensors[sensorType];
+                const threshold = state.thresholds[sensorType];
+                const isDanger = value > threshold;
+                const percentage = Math.min((value / threshold) * 100, 100);
+
+                return `
+                            <div class="sensor-item ${isDanger ? 'danger' : ''}">
+                                <div class="sensor-header">
+                                    <span class="sensor-name">
+                                        ${sensor.icon} ${sensor.name}
+                                    </span>
+                                    <span class="sensor-value ${isDanger ? 'danger' : ''}">
+                                        ${value.toFixed(1)} ${sensor.unit}
+                                    </span>
+                                </div>
+                                <div class="sensor-bar">
+                                    <div class="sensor-progress ${isDanger ? 'danger' : ''}" 
+                                         style="width: ${percentage}%"></div>
+                                </div>
+                                <div class="sensor-limit">
+                                    Safe Limit: ≤ ${threshold} ${sensor.unit}
+                                </div>
+                            </div>
+                        `;
+            }).join('')}
+                </div>
+            `;
+        }
+
+        function renderAdminControls() {
+            return `
+                <div class="admin-section">
+                    <h3>⚙️ Safety Threshold Configuration</h3>
+                    <p style="color: #666; margin-bottom: 20px;">Adjust safe limits for each sensor type across all flats</p>
+                    <div class="threshold-grid">
+                        ${Object.keys(state.sensors).map(sensorType => {
+                const sensor = state.sensors[sensorType];
+                return `
+                                <div class="threshold-item">
+                                    <label>${sensor.icon} ${sensor.name}</label>
+                                    <input type="number" 
+                                           class="threshold-input"
+                                           value="${state.thresholds[sensorType]}"
+                                           onchange="updateThreshold('${sensorType}', this.value)"
+                                           step="1"
+                                           min="0">
+                                    <div style="font-size: 12px; color: #666; margin-top: 5px;">
+                                        Current: ${state.thresholds[sensorType]} ${sensor.unit}
+                                    </div>
+                                </div>
+                            `;
+            }).join('')}
+                    </div>
+                    <button class="btn btn-primary" onclick="saveThresholds()">💾 Save All Thresholds</button>
+                </div>
+
+                <div class="admin-section">
+                    <h3>🧪 Manual Alert Testing</h3>
+                    <p style="color: #666; margin-bottom: 20px;">Trigger test alerts for demonstration purposes</p>
+                    <div style="margin-bottom: 15px;">
+                        <label style="font-weight: 600; display: block; margin-bottom: 8px;">Select Flat:</label>
+                        <select id="testFlat" style="width: 100%; padding: 10px; border: 2px solid #ddd; border-radius: 6px;">
+                            ${state.flats.map(f => `
+                                <option value="${f.flatNumber}">Flat ${f.flatNumber} (Floor ${f.floor})</option>
+                            `).join('')}
+                        </select>
+                    </div>
+                    <div style="margin-bottom: 15px;">
+                        <label style="font-weight: 600; display: block; margin-bottom: 8px;">Select Sensor to Test:</label>
+                    </div>
+                    <div class="test-alert-grid">
+                        ${Object.keys(state.sensors).map(sensorType => {
+                const sensor = state.sensors[sensorType];
+                return `
+                                <button class="btn btn-outline" 
+                                        onclick="triggerAlert(parseInt(document.getElementById('testFlat').value), '${sensorType}')">
+                                    ${sensor.icon} ${sensor.name.replace(/[🔥💨🔴🌡️💧👤]/g, '').trim()}
+                                </button>
+                            `;
+            }).join('')}
+                    </div>
+                    <button class="btn btn-outline" style="margin-top: 15px; width: 100%; background: #dc3545; color: white;"
+                            onclick="clearAllAlerts(); acknowledgeAlert();">
+                        🔄 Clear All Alerts
+                    </button>
+                </div>
+            `;
+        }
+
+        function renderAlertHistory() {
+            return `
+                <div class="admin-section">
+                    <h3>📋 Alert History Log</h3>
+                    ${state.alertHistory.length > 0 ? `
+                        <button class="btn btn-danger" onclick="state.alertHistory = []; render();">
+                            🗑️ Clear History
+                        </button>
+                    ` : ''}
+                    <div class="alert-history">
+                        ${state.alertHistory.length === 0 ? `
+                            <p style="text-align: center; color: #666; padding: 40px;">
+                                No alerts recorded yet
+                            </p>
+                        ` : state.alertHistory.map(alert => `
+                            <div class="alert-log-item ${alert.status === 'cleared' ? 'cleared' : ''}">
+                                <div class="alert-info">
+                                    <div class="alert-timestamp">
+                                        ${alert.timestamp.toLocaleString()}
+                                        ${alert.clearedAt ? ` → Cleared: ${alert.clearedAt.toLocaleString()}` : ''}
+                                    </div>
+                                    <div class="alert-details">
+                                        🏢 Flat ${alert.flat} | ${alert.sensorName}: ${alert.value} ${alert.unit}
+                                    </div>
+                                    <div style="font-size: 12px; color: #666;">
+                                        Emergency: ${alert.emergency.service} (${alert.emergency.number})
+                                    </div>
+                                </div>
+                                <div style="font-size: 20px;">
+                                    ${alert.status === 'active' ? '🚨' : '✅'}
+                                </div>
+                            </div>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderAnalytics() {
+            const totalAlerts = state.alertHistory.length;
+            const activeAlerts = state.alertHistory.filter(a => a.status === 'active').length;
+            const clearedAlerts = totalAlerts - activeAlerts;
+            const affectedFlats = new Set(state.alertHistory.map(a => a.flat)).size;
+
+            return `
+                <div class="admin-section">
+                    <h3>📊 System Analytics</h3>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-number">${totalAlerts}</div>
+                            <div class="stat-label">Total Alerts</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" style="color: #dc3545;">${activeAlerts}</div>
+                            <div class="stat-label">Active Alerts</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number" style="color: #28a745;">${clearedAlerts}</div>
+                            <div class="stat-label">Cleared Alerts</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-number">${affectedFlats}</div>
+                            <div class="stat-label">Flats Affected</div>
+                        </div>
+                    </div>
+
+                    <h4 style="margin: 30px 0 15px 0;">Alert Distribution by Sensor Type</h4>
+                    <div class="threshold-grid">
+                        ${Object.keys(state.sensors).map(sensorType => {
+                const count = state.alertHistory.filter(a => a.sensor === sensorType).length;
+                const percentage = totalAlerts > 0 ? ((count / totalAlerts) * 100).toFixed(1) : 0;
+                return `
+                                <div class="threshold-item">
+                                    <div style="font-weight: 600; margin-bottom: 10px;">
+                                        ${state.sensors[sensorType].icon} ${state.sensors[sensorType].name.replace(/[🔥💨🔴🌡️💧👤]/g, '').trim()}
+                                    </div>
+                                    <div style="font-size: 24px; font-weight: bold; color: #667eea;">
+                                        ${count}
+                                    </div>
+                                    <div style="font-size: 12px; color: #666;">
+                                        ${percentage}% of total alerts
+                                    </div>
+                                </div>
+                            `;
+            }).join('')}
+                    </div>
+
+                    <h4 style="margin: 30px 0 15px 0;">System Health Status</h4>
+                    <div style="background: white; padding: 20px; border-radius: 10px;">
+                        <div style="margin-bottom: 15px;">
+                            <strong>Safe Flats:</strong> ${state.flats.filter(f => !f.hasAlert).length} / 32
+                            <div style="width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin-top: 5px;">
+                                <div style="width: ${(state.flats.filter(f => !f.hasAlert).length / 32) * 100}%; height: 100%; background: linear-gradient(90deg, #28a745, #20c997); border-radius: 10px;"></div>
+                            </div>
+                        </div>
+                        <div>
+                            <strong>Alert Flats:</strong> ${state.flats.filter(f => f.hasAlert).length} / 32
+                            <div style="width: 100%; height: 20px; background: #e9ecef; border-radius: 10px; margin-top: 5px;">
+                                <div style="width: ${(state.flats.filter(f => f.hasAlert).length / 32) * 100}%; height: 100%; background: linear-gradient(90deg, #dc3545, #c82333); border-radius: 10px;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderControlRoom() {
+            const alertCount = state.flats.filter(f => f.hasAlert).length;
+
+            return `
+                <div class="header">
+                    <div>
+                        <h1>🎛️ Control Room Dashboard</h1>
+                        <p style="color: #666;">Centralized Monitoring System</p>
+                    </div>
+                    <div class="header-info">
+                        <div class="status-badge ${alertCount > 0 ? 'status-alert' : 'status-safe'}">
+                            ${alertCount > 0 ? `🚨 ${alertCount} Active Alert${alertCount > 1 ? 's' : ''}` : '✓ All Safe'}
+                        </div>
+                        <button class="btn btn-danger" onclick="handleLogout()">Logout</button>
+                    </div>
+                </div>
+
+                <div class="control-tabs">
+                    <button class="tab-btn ${state.currentTab === 'overview' ? 'active' : ''}" 
+                            onclick="state.currentTab = 'overview'; state.selectedFlat = null; render();">
+                        🏢 Overview
+                    </button>
+                    <button class="tab-btn ${state.currentTab === 'admin' ? 'active' : ''}" 
+                            onclick="state.currentTab = 'admin'; render();">
+                        ⚙️ Admin Controls
+                    </button>
+                    <button class="tab-btn ${state.currentTab === 'history' ? 'active' : ''}" 
+                            onclick="state.currentTab = 'history'; render();">
+                        📋 Alert History
+                    </button>
+                    <button class="tab-btn ${state.currentTab === 'analytics' ? 'active' : ''}" 
+                            onclick="state.currentTab = 'analytics'; render();">
+                        📊 Analytics
+                    </button>
+                </div>
+
+                <div class="tab-content">
+                    ${state.selectedFlat ? renderFlatDetails() :
+                    state.currentTab === 'overview' ? renderControlRoomOverview() :
+                        state.currentTab === 'admin' ? renderAdminControls() :
+                            state.currentTab === 'history' ? renderAlertHistory() :
+                                renderAnalytics()}
+                </div>
+            `;
+        }
+
+        function renderBuzzerPopup() {
+            if (!state.showBuzzer || !state.currentAlert) return '';
+
+            const { flat, sensor, sensorName, value, unit, emergency } = state.currentAlert;
+
+            return `
+                <div class="buzzer-overlay">
+                    <div class="buzzer-popup">
+                        <div class="buzzer-header">
+                            <div class="buzzer-icon">🚨</div>
+                            <div class="buzzer-title">DANGER ALERT!</div>
+                        </div>
+
+                        <div class="auto-dial-notice">
+                            📞 AUTO-DIALING EMERGENCY
+                        </div>
+
+                        <div class="buzzer-content">
+                            <div class="alert-detail">
+                                <span class="alert-label">Flat Number:</span>
+                                <span class="alert-value">Flat ${flat}</span>
+                            </div>
+                            <div class="alert-detail">
+                                <span class="alert-label">Sensor:</span>
+                                <span class="alert-value">${sensorName}</span>
+                            </div>
+                            <div class="alert-detail">
+                                <span class="alert-label">Reading:</span>
+                                <span class="alert-value" style="color: #dc3545;">${value} ${unit}</span>
+                            </div>
+                            <div class="alert-detail">
+                                <span class="alert-label">Time:</span>
+                                <span class="alert-value">${new Date().toLocaleTimeString()}</span>
+                            </div>
+                        </div>
+
+                        <div class="emergency-card">
+                            <div style="font-size: 40px; margin-bottom: 10px;">${emergency.icon}</div>
+                            <div class="emergency-service">${emergency.service}</div>
+                            <div class="emergency-number">${emergency.number}</div>
+                            <div style="margin-top: 10px; font-size: 14px;">Location: Flat ${flat}</div>
+                        </div>
+
+                        <div class="popup-buttons">
+                            <button class="btn btn-danger" onclick="window.location.href='tel:${emergency.number}'">
+                                📞 Call Now
+                            </button>
+                            <button class="btn btn-primary" onclick="acknowledgeAlert()">
+                                ✓ Acknowledge
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function render() {
+            const app = document.getElementById('app');
+
+            if (!state.isLoggedIn) {
+                app.innerHTML = renderLogin();
+            } else if (state.loginType === 'flat') {
+                app.innerHTML = renderFlatOwnerView() + renderBuzzerPopup();
+            } else if (state.loginType === 'simulator') {
+                app.innerHTML = renderSimulatorView() + renderBuzzerPopup();
+            } else {
+                app.innerHTML = renderControlRoom() + renderBuzzerPopup();
+            }
+        }
+
+        // Initialize
+        initializeFlats();
+        render();
+    </script>
+</body>
+
+</html>
